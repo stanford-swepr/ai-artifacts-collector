@@ -394,3 +394,22 @@ class TestCollectRepoStaticMetrics:
                      "total_lines", "total_tags", "total_remote_branches",
                      "commits_last_year"]:
             assert isinstance(metrics[key], int), f"{key} should be int, got {type(metrics[key])}"
+
+    def test_languages_present(self, temp_git_repo):
+        """Result contains a 'languages' key."""
+        metrics = collect_repo_static_metrics(temp_git_repo)
+        assert "languages" in metrics
+
+    def test_languages_is_dict(self, temp_git_repo):
+        """Languages value is a dict."""
+        metrics = collect_repo_static_metrics(temp_git_repo)
+        assert isinstance(metrics["languages"], dict)
+
+    def test_languages_counts(self, temp_git_repo):
+        """Correct language counts for the fixture repo (.py and .md files)."""
+        metrics = collect_repo_static_metrics(temp_git_repo)
+        langs = metrics["languages"]
+        # file2.py → Python, file3.md → Markdown, file1.txt → not mapped
+        assert langs.get("Python") == 1
+        assert langs.get("Markdown") == 1
+        assert "txt" not in langs and "Text" not in langs

@@ -14,6 +14,58 @@ import re
 from pathlib import Path
 
 
+_EXT_TO_LANGUAGE = {
+    ".py": "Python",
+    ".js": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".jsx": "JavaScript",
+    ".java": "Java",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".rb": "Ruby",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "C++",
+    ".cxx": "C++",
+    ".cc": "C++",
+    ".hpp": "C++",
+    ".cs": "C#",
+    ".swift": "Swift",
+    ".kt": "Kotlin",
+    ".kts": "Kotlin",
+    ".md": "Markdown",
+    ".mdc": "Markdown",
+    ".json": "JSON",
+    ".yaml": "YAML",
+    ".yml": "YAML",
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".scss": "CSS",
+    ".sh": "Shell",
+    ".bash": "Shell",
+    ".zsh": "Shell",
+    ".sql": "SQL",
+    ".r": "R",
+    ".R": "R",
+    ".m": "Objective-C",
+    ".lua": "Lua",
+    ".dart": "Dart",
+    ".ex": "Elixir",
+    ".exs": "Elixir",
+    ".hs": "Haskell",
+    ".scala": "Scala",
+    ".php": "PHP",
+    ".pl": "Perl",
+    ".pm": "Perl",
+    ".xml": "XML",
+    ".toml": "TOML",
+    ".vue": "Vue",
+    ".svelte": "Svelte",
+}
+
+
 def obfuscate_author(email: str, salt: str) -> str:
     """
     Hash author email for privacy protection.
@@ -569,9 +621,23 @@ def collect_repo_static_metrics(repo_path: str, timeout: int = 60) -> Dict[str, 
     # Total tracked files
     out = _run_git(["ls-files"])
     if out:
-        metrics["total_files"] = len(out.splitlines())
+        file_list = out.splitlines()
+        metrics["total_files"] = len(file_list)
     else:
+        file_list = []
         metrics["total_files"] = 0
+
+    # Language breakdown by file extension
+    lang_counts: Dict[str, int] = {}
+    for f in file_list:
+        ext = Path(f).suffix.lower()
+        # Special case: .R must stay uppercase for the lookup
+        if ext == ".r":
+            ext = Path(f).suffix
+        lang = _EXT_TO_LANGUAGE.get(ext)
+        if lang:
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+    metrics["languages"] = dict(sorted(lang_counts.items(), key=lambda x: x[1], reverse=True))
 
     # Total lines across all tracked files (binary files are skipped by wc)
     try:
