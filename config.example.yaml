@@ -35,19 +35,19 @@ author:
   # Privacy strategy for author identities:
   #   "obfuscate"  — SHA-256 hash with per-repo random salt (default)
   #   "anonymize"  — HMAC-SHA-256; requires the "secret" field below to be set
-  strategy: "obfuscate"
+  strategy: "anonymize"
 
   # Shared secret for HMAC-SHA-256 anonymization. Required when strategy
   # is "anonymize". Ignored for "obfuscate".
-  # secret: "my-study-secret"
+  secret: "my-study-secret"
 
   # Number of hex characters to keep from the anonymized hash.
   # Only used when strategy is "anonymize". Default: 12.
-  # hash_length: 12
+  hash_length: 12
 
   # Prefix prepended to anonymized author identifiers (e.g., "user-a1b2c3").
   # Only used when strategy is "anonymize". Default: "user-".
-  # prefix: "user-"
+  prefix: "user-"
 
 paths:
   # Directory where collection output bundles are written.
