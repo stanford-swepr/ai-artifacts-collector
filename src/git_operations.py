@@ -223,6 +223,59 @@ def pull_latest(repo_path: str, branch: str, timeout: int = 300) -> bool:
         raise Exception(f"Pull operation timed out for branch '{branch}'")
 
 
+def find_commit_at_date(repo_path: str, branch: str, end_date: str) -> Optional[str]:
+    """Find the last commit on *branch* on or before *end_date*.
+
+    Args:
+        repo_path: Path to the git repository.
+        branch: Branch to search.
+        end_date: ISO 8601 date string (e.g. "2025-03-31").
+
+    Returns:
+        Commit SHA as a string, or ``None`` if no commit exists before
+        *end_date*.
+    """
+    # --before is exclusive in git, so push the boundary to end-of-day
+    cutoff = f"{end_date}T23:59:59"
+    try:
+        result = subprocess.run(
+            ["git", "log", branch, f"--before={cutoff}", "--format=%H", "-n", "1"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        sha = result.stdout.strip()
+        return sha if sha else None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def reset_to_commit(repo_path: str, commit_sha: str) -> None:
+    """Hard-reset the current branch to *commit_sha*.
+
+    This moves the branch pointer back to the given commit so the working
+    tree reflects the repository state at that point in time.
+
+    Args:
+        repo_path: Path to the git repository.
+        commit_sha: Full or abbreviated commit hash.
+
+    Raises:
+        Exception: If the reset fails.
+    """
+    try:
+        subprocess.run(
+            ["git", "reset", "--hard", commit_sha],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"Failed to reset to {commit_sha}: {e.stderr}")
+
+
 def _extract_repo_name(repo_url: str) -> str:
     """Extract repository name from URL.
 

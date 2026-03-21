@@ -6,6 +6,7 @@ so that tests run fast and without network or GPU access.
 
 import json
 import pickle
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -54,7 +55,7 @@ def config(tmp_path):
         embedding_model="nomic-ai/nomic-embed-text-v1.5",
         embedding_batch_size=16,
         start_date="2020-01-01",
-        end_date="2025-12-31",
+        end_date=date.today().isoformat(),
         author_strategy="obfuscate",
         author_salt="test-salt",
         author_secret="",
@@ -500,6 +501,57 @@ class TestCloneAndPrepareRepo:
 
         assert result == expected
         assert config.repo_path == expected
+
+    @patch("src.pipeline.reset_to_commit")
+    @patch("src.pipeline.find_commit_at_date", return_value="abc123")
+    @patch("src.pipeline.pull_latest")
+    @patch("src.pipeline.checkout_branch")
+    @patch("src.pipeline.clone_repository")
+    def test_resets_to_end_date_when_in_past(
+        self, mock_clone, mock_checkout, mock_pull, mock_find, mock_reset, config
+    ):
+        config.repo_path.mkdir(parents=True)
+        config.end_date = "2025-03-31"
+
+        clone_and_prepare_repo(config)
+
+        mock_find.assert_called_once_with(
+            str(config.repo_path), config.branch, "2025-03-31"
+        )
+        mock_reset.assert_called_once_with(str(config.repo_path), "abc123")
+
+    @patch("src.pipeline.reset_to_commit")
+    @patch("src.pipeline.find_commit_at_date", return_value=None)
+    @patch("src.pipeline.pull_latest")
+    @patch("src.pipeline.checkout_branch")
+    @patch("src.pipeline.clone_repository")
+    def test_raises_when_no_commit_before_end_date(
+        self, mock_clone, mock_checkout, mock_pull, mock_find, mock_reset, config
+    ):
+        config.repo_path.mkdir(parents=True)
+        config.end_date = "2019-01-01"
+
+        with pytest.raises(ValueError, match="No commits found"):
+            clone_and_prepare_repo(config)
+
+        mock_reset.assert_not_called()
+
+    @patch("src.pipeline.reset_to_commit")
+    @patch("src.pipeline.find_commit_at_date")
+    @patch("src.pipeline.pull_latest")
+    @patch("src.pipeline.checkout_branch")
+    @patch("src.pipeline.clone_repository")
+    def test_skips_reset_when_end_date_is_today(
+        self, mock_clone, mock_checkout, mock_pull, mock_find, mock_reset, config
+    ):
+        config.repo_path.mkdir(parents=True)
+        from datetime import date
+        config.end_date = date.today().isoformat()
+
+        clone_and_prepare_repo(config)
+
+        mock_find.assert_not_called()
+        mock_reset.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,13 @@ temporal:
   # date are excluded from temporal analysis.
   start_date: "2020-01-01"
 
-  # End of the git history window. Omit or set to null to use today's date.
+  # Study cutoff date (ISO 8601). Controls two things:
+  #   1. Repository state — the repo is reset to the last commit on or
+  #      before this date, so artifact discovery reflects the codebase as
+  #      it looked at the cutoff.
+  #   2. Temporal analysis — only commits within start_date..end_date are
+  #      included in timeseries and aggregated statistics.
+  # Omit or set to null to use today's date (no reset, latest state).
   # end_date: "2025-12-31"
 
 author:

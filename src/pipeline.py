@@ -29,7 +29,13 @@ from src.embedding_generator import (
     load_embedding_model,
 )
 from src.file_discovery import discover_artifacts
-from src.git_operations import checkout_branch, clone_repository, pull_latest
+from src.git_operations import (
+    checkout_branch,
+    clone_repository,
+    find_commit_at_date,
+    pull_latest,
+    reset_to_commit,
+)
 from src.temporal_analyzer import (
     analyze_artifact_history,
     anonymize_author,
@@ -67,7 +73,10 @@ class PipelineConfig:
     git_timeout: int = 300       # clone / pull
     git_log_timeout: int = 60    # rev-list / shortlog / ls-files
 
-    # Temporal analysis
+    # Date window — controls both the repository checkout state and temporal
+    # analysis range.  When end_date is in the past the repository is reset to
+    # the last commit on or before that date so that artifact discovery and
+    # git history analysis are consistent.
     start_date: str = "2020-01-01"
     end_date: str = field(default_factory=lambda: date.today().isoformat())
     author_strategy: str = "obfuscate"  # "obfuscate" or "anonymize"
@@ -244,6 +253,15 @@ def clone_and_prepare_repo(
 
     if not repo_path.exists():
         raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
+
+    # If end_date is in the past, rewind the branch to match that date
+    if config.end_date < date.today().isoformat():
+        sha = find_commit_at_date(str(repo_path), config.branch, config.end_date)
+        if sha is None:
+            raise ValueError(
+                f"No commits found on '{config.branch}' before {config.end_date}"
+            )
+        reset_to_commit(str(repo_path), sha)
 
     config.repo_path = repo_path
     return repo_path

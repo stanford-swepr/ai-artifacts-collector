@@ -11,8 +11,10 @@ from src.git_operations import (
     get_current_branch,
     checkout_branch,
     detect_default_branch,
+    find_commit_at_date,
     get_github_repos,
     parse_target,
+    reset_to_commit,
 )
 
 
@@ -432,3 +434,151 @@ class TestParseTarget:
         """SSH URL with no org segment → ValueError."""
         with pytest.raises(ValueError, match="Cannot extract organisation"):
             parse_target("git@github.com:repo.git")
+
+
+# ---------------------------------------------------------------------------
+# find_commit_at_date
+# ---------------------------------------------------------------------------
+
+class TestFindCommitAtDate:
+    @patch("src.git_operations.subprocess.run")
+    def test_returns_sha(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="abc123def456\n", returncode=0)
+        sha = find_commit_at_date("/repo", "main", "2025-03-31")
+        assert sha == "abc123def456"
+        cmd = mock_run.call_args[0][0]
+        assert "--before=2025-03-31T23:59:59" in cmd
+        assert "main" in cmd
+
+    @patch("src.git_operations.subprocess.run")
+    def test_returns_none_when_empty(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        assert find_commit_at_date("/repo", "main", "2020-01-01") is None
+
+    @patch("src.git_operations.subprocess.run")
+    def test_returns_none_on_error(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(1, "git")
+        assert find_commit_at_date("/repo", "main", "2025-03-31") is None
+
+
+# ---------------------------------------------------------------------------
+# reset_to_commit
+# ---------------------------------------------------------------------------
+
+class TestResetToCommit:
+    @patch("src.git_operations.subprocess.run")
+    def test_calls_git_reset_hard(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        reset_to_commit("/repo", "abc123")
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["git", "reset", "--hard", "abc123"]
+
+    @patch("src.git_operations.subprocess.run")
+    def test_raises_on_failure(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(1, "git", stderr="error")
+        with pytest.raises(Exception, match="Failed to reset"):
+            reset_to_commit("/repo", "abc123")
+
+
+# ---------------------------------------------------------------------------
+# find_commit_at_date + reset_to_commit — integration with real git repo
+# ---------------------------------------------------------------------------
+
+class TestDateResetIntegration:
+    """Integration tests using a real local git repo with backdated commits."""
+
+    @pytest.fixture
+    def repo_with_history(self, tmp_path):
+        """Create a git repo with three commits at known dates:
+
+        - 2024-06-15: initial commit (file_v1.txt)
+        - 2025-02-01: add file_v2.txt
+        - 2025-06-01: add file_v3.txt
+        """
+        repo = tmp_path / "test-repo"
+        repo.mkdir()
+        env = {
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+        }
+
+        def _commit(msg, date_str):
+            commit_env = {**env,
+                          "GIT_AUTHOR_DATE": date_str,
+                          "GIT_COMMITTER_DATE": date_str}
+            subprocess.run(["git", "add", "."], cwd=str(repo), check=True,
+                           capture_output=True, env={**os.environ, **commit_env})
+            subprocess.run(["git", "commit", "-m", msg], cwd=str(repo),
+                           check=True, capture_output=True,
+                           env={**os.environ, **commit_env})
+
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(repo),
+                        check=True, capture_output=True)
+
+        (repo / "file_v1.txt").write_text("version 1")
+        _commit("initial commit", "2024-06-15T12:00:00")
+
+        (repo / "file_v2.txt").write_text("version 2")
+        _commit("add v2", "2025-02-01T12:00:00")
+
+        (repo / "file_v3.txt").write_text("version 3")
+        _commit("add v3", "2025-06-01T12:00:00")
+
+        return repo
+
+    def test_find_commit_returns_correct_sha(self, repo_with_history):
+        repo = str(repo_with_history)
+
+        # Before v3 but after v2 → should return v2 commit
+        sha = find_commit_at_date(repo, "main", "2025-03-31")
+        assert sha is not None
+
+        # Verify it's the v2 commit by checking its message
+        result = subprocess.run(
+            ["git", "log", sha, "--format=%s", "-n", "1"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == "add v2"
+
+    def test_find_commit_before_all_returns_none(self, repo_with_history):
+        sha = find_commit_at_date(str(repo_with_history), "main", "2020-01-01")
+        assert sha is None
+
+    def test_find_commit_after_all_returns_latest(self, repo_with_history):
+        sha = find_commit_at_date(str(repo_with_history), "main", "2099-12-31")
+        result = subprocess.run(
+            ["git", "log", sha, "--format=%s", "-n", "1"],
+            cwd=str(repo_with_history), capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == "add v3"
+
+    def test_reset_changes_working_tree(self, repo_with_history):
+        repo = repo_with_history
+
+        # All three files should exist now
+        assert (repo / "file_v1.txt").exists()
+        assert (repo / "file_v2.txt").exists()
+        assert (repo / "file_v3.txt").exists()
+
+        # Reset to before v3 was added
+        sha = find_commit_at_date(str(repo), "main", "2025-03-31")
+        reset_to_commit(str(repo), sha)
+
+        # v3 should be gone, v1 and v2 still present
+        assert (repo / "file_v1.txt").exists()
+        assert (repo / "file_v2.txt").exists()
+        assert not (repo / "file_v3.txt").exists()
+
+    def test_reset_to_initial_commit(self, repo_with_history):
+        repo = repo_with_history
+
+        sha = find_commit_at_date(str(repo), "main", "2024-12-31")
+        reset_to_commit(str(repo), sha)
+
+        # Only v1 should remain
+        assert (repo / "file_v1.txt").exists()
+        assert not (repo / "file_v2.txt").exists()
+        assert not (repo / "file_v3.txt").exists()
