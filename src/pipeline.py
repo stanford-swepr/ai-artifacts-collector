@@ -248,7 +248,22 @@ def clone_and_prepare_repo(
             timeout=config.git_timeout,
         )
 
-    checkout_branch(str(repo_path), config.branch)
+    # Detect actual branch (clone may have defaulted to a different name)
+    try:
+        import subprocess as _sp
+        actual_branch = _sp.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_path), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        actual_branch = config.branch
+
+    try:
+        checkout_branch(str(repo_path), config.branch)
+    except Exception:
+        # Requested branch doesn't exist — use the repo's default branch
+        config.branch = actual_branch
+
     pull_latest(str(repo_path), config.branch, timeout=config.git_timeout)
 
     if not repo_path.exists():

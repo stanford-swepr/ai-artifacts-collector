@@ -57,18 +57,14 @@ def test_invalid_url():
         clone_repository("not-a-valid-url", "/tmp/test")
 
 
-def test_branch_not_exists(tmp_path):
-    """Non-existent branch should raise error"""
+def test_branch_not_exists_falls_back_to_default(tmp_path):
+    """Non-existent branch should fall back to repo's default branch"""
     repo_url = "https://github.com/octocat/Hello-World.git"
     clone_dir = tmp_path / "repos"
 
-    with pytest.raises(Exception) as exc_info:
-        clone_repository(repo_url, str(clone_dir), branch="nonexistent-branch-xyz")
-
-    # Verify the error message indicates branch issue
-    error_msg = str(exc_info.value).lower()
-    assert 'branch' in error_msg or 'checkout' in error_msg or 'pathspec' in error_msg, \
-        f"Error message should indicate branch issue, got: {exc_info.value}"
+    # Should not raise — falls back to the default branch
+    result = clone_repository(repo_url, str(clone_dir), branch="nonexistent-branch-xyz")
+    assert Path(result).exists()
 
 
 def test_is_git_repository(tmp_path):
@@ -184,7 +180,7 @@ def test_directory_exists_but_not_git_repo(tmp_path):
     # Create a non-git directory with the same name as the repo
     clone_dir = tmp_path / "repos"
     clone_dir.mkdir()
-    fake_repo_dir = clone_dir / "Hello-World"
+    fake_repo_dir = clone_dir / "octocat__Hello-World"
     fake_repo_dir.mkdir()
 
     repo_url = "https://github.com/octocat/Hello-World.git"
@@ -194,17 +190,17 @@ def test_directory_exists_but_not_git_repo(tmp_path):
     assert "not a git repository" in str(exc_info.value)
 
 
-def test_clone_existing_repo_with_invalid_branch(tmp_path):
-    """Test error when trying to checkout invalid branch on existing repo"""
+def test_clone_existing_repo_with_invalid_branch_falls_back(tmp_path):
+    """Existing repo with invalid branch should fall back to current branch"""
     repo_url = "https://github.com/octocat/Hello-World.git"
     clone_dir = tmp_path / "repos"
 
     # First clone with valid branch
     clone_repository(repo_url, str(clone_dir), branch="master")
 
-    # Try to clone again with invalid branch (should attempt checkout and fail)
-    with pytest.raises(Exception):
-        clone_repository(repo_url, str(clone_dir), branch="nonexistent-branch-xyz")
+    # Should not raise — falls back to existing branch
+    result = clone_repository(repo_url, str(clone_dir), branch="nonexistent-branch-xyz")
+    assert Path(result).exists()
 
 
 def _make_repo_json(name, private=False):

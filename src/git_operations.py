@@ -7,10 +7,12 @@ This module provides utilities for:
 - Validating git repositories
 """
 import base64
+import os
 import subprocess
 import shutil
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
@@ -207,20 +209,25 @@ def pull_latest(repo_path: str, branch: str, timeout: int = 300) -> bool:
     Raises:
         Exception: If pull fails
     """
+    # Use idle timeout — watch .git dir for incoming objects
+    git_dir = str(Path(repo_path) / ".git")
     try:
-        result = subprocess.run(
+        _run_with_idle_timeout(
             ["git", "pull", "origin", branch],
+            idle_timeout=timeout,
+            watch_path=git_dir,
             cwd=repo_path,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=timeout
         )
         return True
     except subprocess.CalledProcessError as e:
-        raise Exception(f"Failed to pull latest changes for '{branch}': {e.stderr}")
+        stderr = e.stderr or ""
+        raise Exception(f"Failed to pull latest changes for '{branch}': {stderr}")
     except subprocess.TimeoutExpired:
-        raise Exception(f"Pull operation timed out for branch '{branch}'")
+        raise Exception(f"Pull operation timed out for branch '{branch}' (no progress for {timeout}s)")
 
 
 def find_commit_at_date(repo_path: str, branch: str, end_date: str) -> Optional[str]:
@@ -303,6 +310,31 @@ def _extract_repo_name(repo_url: str) -> str:
 
     return repo_name
 
+
+def extract_qualified_repo_name(repo_url: str) -> str:
+    """Extract owner__repo name from URL to avoid collisions.
+
+    Returns 'owner__repo' for URLs like https://github.com/owner/repo.git.
+    Falls back to bare repo name if owner cannot be determined.
+    """
+    url = repo_url.strip().rstrip('/')
+    if url.endswith('.git'):
+        url = url[:-4]
+
+    # SSH format: git@github.com:owner/repo
+    ssh_match = re.match(r'^git@[^:]+:(.+)$', url)
+    if ssh_match:
+        parts = ssh_match.group(1).split('/')
+        if len(parts) >= 2:
+            return f"{parts[-2]}__{parts[-1]}"
+        return parts[-1]
+
+    # HTTPS format: https://github.com/owner/repo
+    parts = url.split('/')
+    if len(parts) >= 2:
+        return f"{parts[-2]}__{parts[-1]}"
+    return parts[-1]
+
 def _build_authenticated_url(repo_url: str, token: Optional[str]) -> str:
     """Embed a token into an HTTPS repo URL for git operations.
 
@@ -363,6 +395,80 @@ def detect_default_branch(repo_url: str, token: Optional[str] = None, timeout: i
     return None
 
 
+def _run_with_idle_timeout(cmd, idle_timeout, watch_path=None, **kwargs):
+    """Run a subprocess with an idle-based timeout.
+
+    Instead of a fixed total timeout, the process is only killed if no
+    progress is detected for *idle_timeout* seconds.  Progress is measured
+    by checking whether *watch_path* (directory or file) has changed in
+    size since the last check.  If *watch_path* is ``None`` the function
+    falls back to a regular total timeout.
+
+    Returns a ``subprocess.CompletedProcess``-like object.
+
+    Raises:
+        subprocess.TimeoutExpired: if idle timeout is exceeded.
+        subprocess.CalledProcessError: if the process exits non-zero.
+    """
+    if watch_path is None:
+        return subprocess.run(cmd, timeout=idle_timeout, **kwargs)
+
+    check = kwargs.pop("check", False)
+    poll_interval = 5  # seconds between progress checks
+    proc = subprocess.Popen(cmd, **kwargs)
+    last_size = -1
+    last_progress_time = time.monotonic()
+
+    try:
+        while True:
+            try:
+                proc.wait(timeout=poll_interval)
+                # Process finished
+                break
+            except subprocess.TimeoutExpired:
+                pass  # still running — check progress
+
+            # Measure directory size (fast: just sum immediate children sizes)
+            current_size = 0
+            watch = Path(watch_path)
+            if watch.exists():
+                try:
+                    if watch.is_dir():
+                        for entry in os.scandir(str(watch)):
+                            try:
+                                current_size += entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                pass
+                    else:
+                        current_size = watch.stat().st_size
+                except OSError:
+                    pass
+
+            if current_size != last_size:
+                last_size = current_size
+                last_progress_time = time.monotonic()
+
+            elapsed_idle = time.monotonic() - last_progress_time
+            if elapsed_idle > idle_timeout:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd, idle_timeout)
+
+        # Check return code
+        stdout = proc.stdout.read() if proc.stdout else None
+        stderr = proc.stderr.read() if proc.stderr else None
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode, cmd, output=stdout, stderr=stderr,
+            )
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+
+
 def clone_repository(repo_url: str, clone_dir: str, branch: str = "main", token: Optional[str] = None, timeout: int = 300) -> str:
     """Clone a git repository and checkout specified branch with provider-aware auth."""
 
@@ -383,8 +489,8 @@ def clone_repository(repo_url: str, clone_dir: str, branch: str = "main", token:
     except PermissionError:
         raise PermissionError(f"Permission denied creating directory: {clone_dir}")
 
-    # Extract repo name
-    repo_name = _extract_repo_name(repo_url)
+    # Extract qualified repo name (owner__repo) to avoid collisions
+    repo_name = extract_qualified_repo_name(repo_url)
     target_path = clone_path / repo_name
 
     # Check if directory already exists
@@ -395,18 +501,22 @@ def clone_repository(repo_url: str, clone_dir: str, branch: str = "main", token:
                 checkout_branch(str(target_path), branch)
                 return str(target_path.absolute())
             except Exception:
-                raise
+                # Repo exists but is corrupted (e.g. broken HEAD, incomplete clone).
+                # Remove and re-clone below.
+                shutil.rmtree(target_path)
         else:
             raise Exception(f"Directory exists but is not a git repository: {target_path}")
 
-    # Clone the repository
+    # Clone the repository (idle timeout — keeps running as long as data flows)
     try:
-        subprocess.run(
+        _run_with_idle_timeout(
             ["git", "clone", authenticated_url, str(target_path)],
-            capture_output=True,
+            idle_timeout=timeout,
+            watch_path=str(target_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=timeout
         )
     except subprocess.CalledProcessError as e:
         # Mask the token in error logs
@@ -430,13 +540,21 @@ def clone_repository(repo_url: str, clone_dir: str, branch: str = "main", token:
     except subprocess.TimeoutExpired:
         raise Exception(f"Clone operation timed out for {repo_url}")
 
-    # Checkout the specified branch
+    # Checkout the specified branch (skip if clone already landed on it)
     try:
-        checkout_branch(str(target_path), branch)
-    except Exception as e:
-        if target_path.exists():
-            shutil.rmtree(str(target_path))
-        raise
+        current = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(target_path), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        current = None
+
+    if current != branch:
+        try:
+            checkout_branch(str(target_path), branch)
+        except Exception:
+            # Branch doesn't exist — keep the default branch from clone
+            pass
 
     return str(target_path.absolute())
 

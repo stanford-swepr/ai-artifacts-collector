@@ -24,6 +24,7 @@ Usage (repos file — one URL per line, model loaded once):
 import argparse
 import gc
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -36,7 +37,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.git_operations import detect_default_branch, get_repo_details, parse_target
+from src.git_operations import detect_default_branch, extract_qualified_repo_name, get_repo_details, parse_target
 from src.pipeline import (
     PipelineConfig,
     bundle_artifacts_config,
@@ -151,7 +152,7 @@ def run_from_file(args):
 
         repo_url = info["repo_url"] if info["repo_url"] else url
         org = info["org"]
-        repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+        repo_name = extract_qualified_repo_name(repo_url)
 
         progress = f"[{idx}/{total_repos}]"
 
@@ -159,7 +160,20 @@ def run_from_file(args):
         if info["mode"] == "single-repo":
             branch = detect_default_branch(repo_url, args.token)
             if not branch:
-                branch = "main"
+                # Try common default branch names via ls-remote
+                for candidate in ("main", "master"):
+                    try:
+                        result = subprocess.run(
+                            ["git", "ls-remote", "--heads", repo_url, candidate],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        if result.returncode == 0 and candidate in result.stdout:
+                            branch = candidate
+                            break
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                        continue
+                else:
+                    branch = "main"
         else:
             branch = "main"
 
@@ -355,7 +369,7 @@ def main():
     for idx, repo in enumerate(repositories, 1):
         repo_url = repo["url"]
         branch = repo["branch"]
-        repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+        repo_name = extract_qualified_repo_name(repo_url)
 
         progress = f"[{idx}/{total_repos}]"
 
