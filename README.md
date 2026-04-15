@@ -74,6 +74,76 @@ python scripts/artifacts_collection.py \
 
 The embedding model is loaded once and reused across all repositories. Supported providers: GitHub, GitLab, Azure DevOps, Bitbucket.
 
+### Monthly Snapshot Collection
+
+`collect_monthly.sh` runs the pipeline repeatedly against a single repo list, once per first-of-month snapshot date. Each snapshot checks out the repo at the state as of that date and runs temporal analysis over the preceding month. Output is organised per repo per snapshot so each month is independently analysable.
+
+**Window semantics** — for a snapshot dated `YYYY-MM-01`:
+- **Embeddings** reflect the repo state as of that date (last commit on or before).
+- **Temporal analysis** covers `[prev_month_first, YYYY-MM-01)` — commits during the month immediately prior.
+- **First snapshot exception:** the earliest snapshot uses `[2020-01-01, first_snapshot)` as a cumulative baseline so the full pre-window history is captured once.
+
+**Default snapshot list:** 23 first-of-month dates from `2024-01-01` through `2025-11-01`.
+
+```bash
+# Full run — 23 snapshots × every repo in repos_msrc.txt
+./collect_monthly.sh
+
+# Subset of dates (positional args override the default list)
+./collect_monthly.sh 2024-01-01 2024-02-01 2024-03-01
+
+# Different repo list
+REPOS_FILE=path/to/other_repos.txt ./collect_monthly.sh
+
+# Private repos
+TOKEN=ghp_xxx ./collect_monthly.sh
+
+# Detached long-running execution
+mkdir -p output/msrc/logs
+nohup ./collect_monthly.sh > output/msrc/logs/full_run.log 2>&1 &
+```
+
+**Inputs:**
+- `repos_msrc.txt` — default repo list (one URL per line; `REPOS_FILE=` overrides).
+- `config.yaml` — base config; the script generates a per-snapshot temp config that overrides `temporal.{start_date,end_date}` and pins paths to `output/msrc/` and `../analyzed_repos/msrc/`.
+
+**Output layout:**
+
+```
+output/msrc/
+├── Artifacts/                             # bundled tool configs
+├── manifest.json
+├── .done_YYYY-MM-DD                       # per-snapshot completion marker
+├── logs/
+│   ├── collect_YYYY-MM-DD.log             # full pipeline output per snapshot
+│   ├── failed_YYYY-MM-DD.tsv              # URL\terror_reason for failed repos
+│   └── full_run.log                       # combined stdout (if you tee'd it)
+└── {repo_name}/
+    └── YYYY-MM-DD/
+        ├── {repo}_file_artifacts.csv
+        ├── {repo}_embeddings.pkl
+        ├── {repo}_embedding_metadata.csv
+        ├── {repo}_artifact_timeseries.csv
+        └── {repo}_repo_metrics.json
+```
+
+**Resumability** — each completed snapshot touches `.done_YYYY-MM-DD`. Rerunning the script skips marked snapshots automatically, so Ctrl+C and resume are safe. Within a snapshot, `check_output_complete` skips repos that already have their output files.
+
+**Retrying failed repos** — failures per snapshot are captured in `logs/failed_YYYY-MM-DD.tsv` (tab-separated `URL\terror_reason`). Common error categories:
+- `No commits found on '<branch>' before <date>` — repo didn't exist yet at the snapshot date; not retryable, expected.
+- `Failed to clone...` / `Pull operation timed out` — network/auth issues; retryable.
+
+To retry just the failed repos of a snapshot:
+```bash
+rm output/msrc/.done_2024-03-01
+REPOS_FILE=<(cut -f1 output/msrc/logs/failed_2024-03-01.tsv) ./collect_monthly.sh 2024-03-01
+```
+
+**Notes:**
+- The embedding model is loaded once per snapshot (not per repo) — same as the standard batch CLI.
+- Between snapshots, every clone under `../analyzed_repos/msrc/` is reset to `origin/<branch>` before the pipeline runs. This prevents slow fast-forward checkouts through large branch divergences on subsequent resets.
+- `commit_aggregated.csv` is intentionally not emitted in this workflow (see `temporal_analyzer.analyze_artifact_history`) — only `artifact_timeseries.csv` contains per-commit artifact touches.
+
 ### Python API
 
 ```python
@@ -151,8 +221,7 @@ Every collection run produces a **self-contained output bundle**:
 │   ├── {repo1}_file_artifacts.csv     # File-level metadata
 │   ├── {repo1}_embeddings.pkl         # Embedding vectors (768-dim)
 │   ├── {repo1}_embedding_metadata.csv # Per-file embedding info
-│   ├── {repo1}_artifact_timeseries.csv# Git history events
-│   ├── {repo1}_commit_aggregated.csv  # Commit statistics
+│   ├── {repo1}_artifact_timeseries.csv# Git history events (commit_date + author_date)
 │   └── {repo1}_repo_metrics.json      # Static repo metrics
 └── {repo2}/
     └── ...
