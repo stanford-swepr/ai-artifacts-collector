@@ -186,7 +186,7 @@ def _fetch_all_commits_with_status(
     Fetch all commits in a date range with per-file name-status info in a single git call.
 
     Returns a list of dicts, each with keys:
-        commit_sha, author_name, author_email, commit_date, files
+        commit_sha, author_name, author_email, commit_date, author_date, files
 
     where ``files`` is a list of (status, path) tuples.
     ``status`` is a single letter: A (added), M (modified), D (deleted), etc.
@@ -196,7 +196,7 @@ def _fetch_all_commits_with_status(
         "git", "log",
         "--name-status",
         "--first-parent",
-        "--pretty=format:COMMIT_START%H|%an|%ae|%ad",
+        "--pretty=format:COMMIT_START%H|%an|%ae|%cd|%ad",
         "--date=iso",
         f"--after={start_date}",
         f"--before={end_date}",
@@ -222,12 +222,13 @@ def _fetch_all_commits_with_status(
                 commits.append(current)
             header = line[len("COMMIT_START"):]
             parts = header.split("|")
-            if len(parts) >= 4:
+            if len(parts) >= 5:
                 current = {
                     "commit_sha": parts[0],
                     "author_name": parts[1],
                     "author_email": parts[2],
                     "commit_date": parts[3],
+                    "author_date": parts[4],
                     "files": [],
                 }
             else:
@@ -347,7 +348,7 @@ def get_file_history(
     cmd = [
         "git", "log",
         "--follow",
-        "--pretty=format:%H|%an|%ae|%ad|%s",
+        "--pretty=format:%H|%an|%ae|%cd|%ad|%s",
         "--date=iso",
         f"--after={start_date}",
         f"--before={end_date}",
@@ -370,13 +371,14 @@ def get_file_history(
                 continue
 
             parts = line.split('|')
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 history.append({
                     "commit_sha": parts[0][:7],  # Abbreviated
                     "author_name": parts[1],
                     "author_email": parts[2],
                     "commit_date": parts[3],
-                    "message": parts[4] if len(parts) > 4 else ""
+                    "author_date": parts[4],
+                    "message": parts[5] if len(parts) > 5 else ""
                 })
 
         return history
@@ -437,12 +439,18 @@ def build_artifact_timeseries(
         author_name_hash = hash_fn(commit["author_name"])
         short_sha = commit["commit_sha"][:7]
 
-        # Parse and format date once per commit
+        # Parse and format dates once per commit
         try:
             commit_dt = parse_iso_date(commit["commit_date"])
             commit_date_iso = format_iso_date(commit_dt)
         except ValueError:
             commit_date_iso = commit["commit_date"]
+
+        try:
+            author_dt = parse_iso_date(commit["author_date"])
+            author_date_iso = format_iso_date(author_dt)
+        except ValueError:
+            author_date_iso = commit.get("author_date", commit_date_iso)
 
         for status, path in commit["files"]:
             if path in artifact_paths:
@@ -450,6 +458,7 @@ def build_artifact_timeseries(
                 timeseries.append({
                     "commit_sha": short_sha,
                     "commit_date": commit_date_iso,
+                    "author_date": author_date_iso,
                     "artifact_path": path,
                     "artifact_type": path_to_type[path],
                     "action": status_map.get(status, "modified"),
@@ -485,7 +494,7 @@ def build_commit_aggregated(
     """
     cmd = [
         "git", "log",
-        "--pretty=format:%H|%an|%ae|%ad",
+        "--pretty=format:%H|%an|%ae|%cd|%ad",
         "--numstat",
         "--date=iso",
         f"--after={start_date}",
@@ -516,19 +525,26 @@ def build_commit_aggregated(
 
                 # Start new commit
                 parts = line.split('|')
-                if len(parts) >= 4:
+                if len(parts) >= 5:
                     author_hash = hash_fn(parts[2])
                     author_name_hash = hash_fn(parts[1])
 
-                    # Parse date
+                    # Parse dates
                     try:
                         commit_dt = parse_iso_date(parts[3])
                         commit_date_iso = format_iso_date(commit_dt)
                     except ValueError:
                         commit_date_iso = parts[3]
 
+                    try:
+                        author_dt = parse_iso_date(parts[4])
+                        author_date_iso = format_iso_date(author_dt)
+                    except ValueError:
+                        author_date_iso = parts[4]
+
                     current_commit = {
                         "commit_date": commit_date_iso,
+                        "author_date": author_date_iso,
                         "commit_sha": parts[0][:7],
                         "author_hash": author_hash,
                         "author_name_hash": author_name_hash,
@@ -744,11 +760,7 @@ def analyze_artifact_history(
         repo_path, artifacts, start_date, end_date, hash_fn
     )
 
-    commit_aggregated = build_commit_aggregated(
-        repo_path, start_date, end_date, hash_fn
-    )
-
     return {
         "artifact_timeseries": artifact_timeseries,
-        "commit_aggregated": commit_aggregated
+        "commit_aggregated": []
     }

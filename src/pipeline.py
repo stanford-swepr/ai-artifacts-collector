@@ -466,7 +466,13 @@ def export_results(
     exported: Dict[str, Path] = {}
 
     # --- File metadata (only rows with embeddings for consistency) ----------
-    metadata_with_emb = metadata_df[metadata_df["has_embedding"] == True].copy()  # noqa: E712
+    # When zero artifacts were discovered, metadata_df is an empty DataFrame
+    # with no columns, so indexing by "has_embedding" raises KeyError. Guard
+    # against that and write an empty metadata file in that case.
+    if "has_embedding" in metadata_df.columns:
+        metadata_with_emb = metadata_df[metadata_df["has_embedding"] == True].copy()  # noqa: E712
+    else:
+        metadata_with_emb = metadata_df.copy()
     meta_path = output_dir / f"{repo_name}_file_artifacts.csv"
     metadata_with_emb.to_csv(meta_path, index=False)
     exported["file_artifacts"] = meta_path
