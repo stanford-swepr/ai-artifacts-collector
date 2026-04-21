@@ -24,12 +24,16 @@ Usage (repos file — one URL per line, model loaded once):
 import argparse
 import gc
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -50,22 +54,429 @@ from src.pipeline import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Permanent-failure cache
+# ---------------------------------------------------------------------------
+# Stored at <output_dir>/.permanent_failures.json as {"<url>": "<reason>"}.
+# Populated when a repo fails for a reason that cannot change between
+# snapshots (not-found / auth / permission). Subsequent snapshots read this
+# file and skip cached URLs without touching the network.
+#
+# Transient failures (timeouts, 5xx, network errors) are NOT cached so they
+# can retry in the next snapshot.
+# Per-date failures ("No commits found before <date>") are also NOT cached:
+# a later snapshot's cutoff may include the repo's first commit.
+
+PERMANENT_FAILURE_PATTERNS = (
+    "repository not found",
+    "does not exist",
+    "authentication failed",
+    "permission denied",
+    "access denied",
+    "unknown git provider",
+)
+TRANSIENT_FAILURE_MARKERS = (
+    "timed out",
+    "timeout",
+    "no commits found",
+    "500",
+    "502",
+    "503",
+    "504",
+    "connection refused",
+    "connection reset",
+    "could not resolve host",
+    "temporary failure",
+    "network is unreachable",
+)
+
+
+def _classify_failure(error_msg: str) -> str:
+    """Return 'permanent' if the error can never succeed, 'transient' otherwise."""
+    lower = error_msg.lower()
+    for marker in TRANSIENT_FAILURE_MARKERS:
+        if marker in lower:
+            return "transient"
+    for marker in PERMANENT_FAILURE_PATTERNS:
+        if marker in lower:
+            return "permanent"
+    return "transient"  # fail-safe: retry unknown errors
+
+
+def _load_permanent_failures(output_dir: Path) -> dict[str, str]:
+    cache_path = output_dir / ".permanent_failures.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        import json
+        return json.loads(cache_path.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def _persist_permanent_failure(output_dir: Path, url: str, reason: str) -> None:
+    cache_path = output_dir / ".permanent_failures.json"
+    import json
+    data = _load_permanent_failures(output_dir)
+    if url in data:
+        return
+    data[url] = reason
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass  # best effort
+
+
+def _read_repos_file(repos_path: Path) -> list[tuple[str, str | None]]:
+    """Parse a repos-file into (url, preset_branch) pairs.
+
+    Each non-comment line is either:
+      "<url>"               — branch will be auto-detected
+      "<url>\\t<branch>"    — preset branch skips detect_default_branch / ls-remote
+    """
+    lines = repos_path.read_text().splitlines()
+    entries: list[tuple[str, str | None]] = []
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "\t" in s:
+            url, branch = s.split("\t", 1)
+            entries.append((url.strip(), branch.strip() or None))
+        else:
+            entries.append((s, None))
+    return entries
+
+
+def _read_snapshots_file(path: Path) -> list[tuple[str, str, str]]:
+    """Parse a snapshots-file into (start_date, end_date, label) tuples.
+
+    Each non-comment line is either:
+      "<start_date>\\t<end_date>"           — label is derived from end_date
+      "<start_date>\\t<end_date>\\t<label>" — explicit label
+
+    Dates are ISO ``YYYY-MM-DD`` strings. Order in the file is the order in
+    which snapshots are processed.
+    """
+    out: list[tuple[str, str, str]] = []
+    for raw in path.read_text().splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split("\t")
+        if len(parts) == 2:
+            start, end = parts
+            out.append((start.strip(), end.strip(), end.strip()))
+        elif len(parts) >= 3:
+            start, end, label = parts[:3]
+            out.append((start.strip(), end.strip(), label.strip()))
+        else:
+            raise ValueError(f"Malformed snapshots line: {raw!r}")
+    return out
+
+
+def _reset_clones_to_origin(clone_base_dir: Path) -> None:
+    """Reset every existing clone under *clone_base_dir* to its origin branch tip.
+
+    Between snapshots the pipeline rewinds each clone to a past commit via
+    ``find_commit_at_date`` / ``reset_to_commit``. The next snapshot needs the
+    clone back at origin tip so ``pull_latest`` sees "up to date" and the next
+    ``find_commit_at_date`` has full history to search.
+
+    No-op if *clone_base_dir* does not yet exist.
+    """
+    if not clone_base_dir.exists():
+        return
+    for repo_dir in clone_base_dir.iterdir():
+        if not (repo_dir / ".git").exists():
+            continue
+        try:
+            branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if not branch or branch == "HEAD":
+                continue
+            subprocess.run(
+                ["git", "reset", "--hard", f"origin/{branch}", "--quiet"],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue  # best effort — pipeline will re-attempt via pull_latest
+
+
+def _process_one_repo(
+    entry: tuple,
+    *,
+    token,
+    model,
+    yaml_cfg: dict,
+    clone_base_dir: Path,
+    artifacts_dir: Path,
+    output_dir: Path,
+    author_strategy: str,
+    author_secret: str,
+    permanent_failures: dict,
+    failures_lock: threading.Lock,
+    start_date,
+    end_date,
+    snapshot_label,
+    delete_clone: bool,
+    log_tag: str,
+) -> tuple:
+    """Process a single repo. Returns ``(bucket, payload)``.
+
+    ``bucket`` is one of ``"succeeded"``, ``"failed"``, ``"skipped"``.
+    ``payload`` is a ``repo_name`` (str) for succeeded/skipped or a
+    ``{"url", "error"}`` dict for failed.
+
+    Shared state (*permanent_failures*, print) is protected by *failures_lock*
+    and the Python GIL respectively. Individual ``print`` calls are atomic in
+    CPython so interleaving between threads is at line granularity, not
+    mid-line; that's acceptable for progress output.
+    """
+    url, preset_branch = entry
+
+    # Short-circuit: if a previous snapshot flagged this URL as a permanent
+    # failure (404 / auth / not-found), skip it here without touching git.
+    with failures_lock:
+        cached_reason = permanent_failures.get(url)
+    if cached_reason is not None:
+        print(f"{log_tag} [skip-cached] {url}: {cached_reason}")
+        return "skipped", url
+
+    # Parse each URL to extract org info
+    try:
+        info = parse_target(url)
+    except ValueError as e:
+        print(f"{log_tag} [FAIL] {url}: {e}", file=sys.stderr)
+        if _classify_failure(str(e)) == "permanent":
+            _persist_permanent_failure(output_dir, url, str(e))
+            with failures_lock:
+                permanent_failures[url] = str(e)
+        return "failed", {"url": url, "error": str(e)}
+
+    repo_url = info["repo_url"] if info["repo_url"] else url
+    org = info["org"]
+    repo_name = extract_qualified_repo_name(repo_url)
+
+    # Branch resolution: trust the preset from the repos file when provided
+    # (DB-sourced); otherwise auto-detect.
+    if preset_branch:
+        branch = preset_branch
+    elif info["mode"] == "single-repo":
+        branch = detect_default_branch(repo_url, token)
+        if not branch:
+            # Try common default branch names via ls-remote
+            for candidate in ("main", "master"):
+                try:
+                    result = subprocess.run(
+                        ["git", "ls-remote", "--heads", repo_url, candidate],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if result.returncode == 0 and candidate in result.stdout:
+                        branch = candidate
+                        break
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    continue
+            else:
+                branch = "main"
+    else:
+        branch = "main"
+
+    # Skip if already complete for this snapshot
+    if check_output_complete(output_dir, repo_name, snapshot_label=snapshot_label):
+        print(f"{log_tag} [skip] {repo_name}: output already complete")
+        return "skipped", repo_name
+
+    per_repo_overrides = dict(
+        repo_url=repo_url,
+        branch=branch,
+        repo_name=repo_name,
+        clone_base_dir=clone_base_dir,
+        artifacts_dir=artifacts_dir,
+        output_dir=output_dir,
+        author_strategy=author_strategy,
+        author_salt=str(uuid.uuid4()),
+        author_secret=author_secret,
+        author_org=org,
+    )
+    if start_date is not None:
+        per_repo_overrides["start_date"] = start_date
+    if end_date is not None:
+        per_repo_overrides["end_date"] = end_date
+    if snapshot_label is not None:
+        per_repo_overrides["snapshot_label"] = snapshot_label
+
+    config = config_to_pipeline_config(yaml_cfg, **per_repo_overrides)
+
+    # A single multi-line print keeps the start-banner atomic even under
+    # concurrent workers.
+    print(
+        f"\n{log_tag} [start] {repo_name}\n"
+        f"         url:    {repo_url}\n"
+        f"         branch: {branch}"
+    )
+    repo_start = time.time()
+    try:
+        result = run_pipeline(config, token=token, model=model)
+        elapsed = time.time() - repo_start
+        print(
+            f"{log_tag} [done]  {repo_name} in {elapsed:.1f}s -- "
+            f"{result.n_with_embedding} embeddings, "
+            f"{result.n_without_embedding} skipped"
+        )
+        bucket: tuple = ("succeeded", repo_name)
+    except Exception as e:
+        elapsed = time.time() - repo_start
+        print(f"{log_tag} [FAIL]  {repo_name} after {elapsed:.1f}s: {e}", file=sys.stderr)
+        if _classify_failure(str(e)) == "permanent":
+            _persist_permanent_failure(output_dir, url, str(e))
+            with failures_lock:
+                permanent_failures[url] = str(e)
+        bucket = ("failed", {"url": repo_url, "error": str(e)})
+
+    # Optional per-repo clone cleanup to cap disk usage during large sweeps.
+    if delete_clone:
+        clone_dir = clone_base_dir / repo_name
+        if clone_dir.exists():
+            shutil.rmtree(clone_dir, ignore_errors=True)
+
+    return bucket
+
+
+def _process_repos_for_snapshot(
+    repo_entries: list,
+    *,
+    token,
+    model,
+    yaml_cfg: dict,
+    clone_base_dir: Path,
+    artifacts_dir: Path,
+    output_dir: Path,
+    author_strategy: str,
+    author_secret: str,
+    permanent_failures: dict,
+    start_date,
+    end_date,
+    snapshot_label,
+    delete_clone: bool,
+    parallel_repos: int = 1,
+) -> tuple[list, list, list]:
+    """Run the per-repo pipeline loop for one snapshot window.
+
+    *permanent_failures* is mutated in place — newly observed permanent
+    errors are added so subsequent snapshots skip the URL without touching
+    the network. When *parallel_repos* > 1, repos are processed concurrently
+    via a ``ThreadPoolExecutor``; git I/O and ``model.encode()`` both release
+    the GIL, so threads parallelise effectively. ``model.encode()`` is
+    serialised by an internal lock in ``embedding_generator`` so the MPS/CUDA
+    device isn't hit concurrently.
+
+    Returns ``(succeeded, failed, skipped)`` lists. Aggregation order is
+    non-deterministic under parallel mode, but per-repo outputs on disk are
+    unaffected (each repo writes to its own subdirectory).
+    """
+    total_repos = len(repo_entries)
+    succeeded: list = []
+    failed: list = []
+    skipped: list = []
+    failures_lock = threading.Lock()
+
+    worker_kwargs = dict(
+        token=token,
+        model=model,
+        yaml_cfg=yaml_cfg,
+        clone_base_dir=clone_base_dir,
+        artifacts_dir=artifacts_dir,
+        output_dir=output_dir,
+        author_strategy=author_strategy,
+        author_secret=author_secret,
+        permanent_failures=permanent_failures,
+        failures_lock=failures_lock,
+        start_date=start_date,
+        end_date=end_date,
+        snapshot_label=snapshot_label,
+        delete_clone=delete_clone,
+    )
+
+    def _accept(bucket: str, payload) -> None:
+        if bucket == "succeeded":
+            succeeded.append(payload)
+        elif bucket == "failed":
+            failed.append(payload)
+        elif bucket == "skipped":
+            skipped.append(payload)
+
+    if parallel_repos <= 1:
+        # Serial path — preserves legacy ordering + matches pre-parallel logs.
+        for idx, entry in enumerate(repo_entries, 1):
+            bucket, payload = _process_one_repo(
+                entry, log_tag=f"[{idx}/{total_repos}]", **worker_kwargs,
+            )
+            _accept(bucket, payload)
+    else:
+        # Parallel path: each worker tags logs with its submission index so
+        # output is still traceable even when futures complete out of order.
+        with ThreadPoolExecutor(max_workers=parallel_repos) as pool:
+            futures = {
+                pool.submit(
+                    _process_one_repo,
+                    entry,
+                    log_tag=f"[{idx}/{total_repos}]",
+                    **worker_kwargs,
+                ): idx
+                for idx, entry in enumerate(repo_entries, 1)
+            }
+            for fut in as_completed(futures):
+                try:
+                    bucket, payload = fut.result()
+                except Exception as e:
+                    # A truly unexpected exception that escaped _process_one_repo.
+                    # Log it and classify as failed so resume semantics hold.
+                    idx = futures[fut]
+                    print(f"[{idx}/{total_repos}] [FAIL] worker crashed: {e}",
+                          file=sys.stderr)
+                    _accept("failed", {"url": repo_entries[idx - 1][0],
+                                       "error": f"worker crash: {e}"})
+                    continue
+                _accept(bucket, payload)
+
+    return succeeded, failed, skipped
+
+
 def run_from_file(args):
     """Process repos listed in a text file (one URL per line).
 
-    The embedding model is loaded once and reused across all repos.
+    The embedding model is loaded once and reused across all repos. When
+    ``--snapshots-file`` is provided, the repo loop runs once per snapshot
+    with ``start_date`` / ``end_date`` / ``snapshot_label`` overridden per
+    iteration, and the model is reused across snapshots too.
     """
     repos_path = Path(args.repos_file)
     if not repos_path.exists():
         print(f"Error: repos file not found: {repos_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Read and filter repo URLs
-    lines = repos_path.read_text().splitlines()
-    repo_urls = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-    if not repo_urls:
+    repo_entries = _read_repos_file(repos_path)
+    if not repo_entries:
         print("Error: no repository URLs found in file", file=sys.stderr)
         sys.exit(1)
+    repo_urls = [u for u, _ in repo_entries]  # kept for logging / len()
+
+    # Load snapshot list if provided. An empty list means "single-window mode":
+    # a single pass using start_date / end_date from the YAML config.
+    snapshots: list[tuple[str, str, str]] = []
+    if args.snapshots_file:
+        snap_path = Path(args.snapshots_file)
+        if not snap_path.exists():
+            print(f"Error: snapshots file not found: {snap_path}", file=sys.stderr)
+            sys.exit(1)
+        snapshots = _read_snapshots_file(snap_path)
+        if not snapshots:
+            print("Error: no snapshots found in file", file=sys.stderr)
+            sys.exit(1)
 
     # -- Load YAML config --
     config_path = Path(args.config) if args.config else project_root / "config.yaml"
@@ -116,14 +527,18 @@ def run_from_file(args):
     print(f"  git_timeout:      {git_timeout}s")
     print(f"  git_log_timeout:  {git_log_timeout}s")
     print(f"  author_strategy:  {author_strategy}")
-    print(f"  start_date:       {start_date}")
-    if end_date:
-        print(f"  end_date:         {end_date}")
+    print(f"  parallel_repos:   {args.parallel_repos}")
+    if snapshots:
+        print(f"  snapshots:        {len(snapshots)} windows (loaded from {args.snapshots_file})")
+    else:
+        print(f"  start_date:       {start_date}")
+        if end_date:
+            print(f"  end_date:         {end_date}")
     print(f"  started_at:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     print()
 
-    # Load embedding model ONCE
+    # Load embedding model ONCE (reused across every snapshot + repo).
     dummy_config = PipelineConfig(
         repo_url="", branch="", repo_name="",
         clone_base_dir=clone_base_dir,
@@ -136,85 +551,76 @@ def run_from_file(args):
     bundle_artifacts_config(artifacts_dir, output_dir)
     write_manifest(output_dir, dummy_config)
 
-    # Process repos
-    succeeded = []
-    failed = []
-    skipped = []
+    # Load the per-connection permanent-failure cache so we can skip repos
+    # that previously failed with a non-retryable error.
+    permanent_failures = _load_permanent_failures(output_dir)
+    if permanent_failures:
+        print(f"  [cache] {len(permanent_failures)} repos marked as permanent failures — will skip")
 
-    for idx, url in enumerate(repo_urls, 1):
-        # Parse each URL to extract org info
-        try:
-            info = parse_target(url)
-        except ValueError as e:
-            print(f"[{idx}/{total_repos}] [FAIL] {url}: {e}", file=sys.stderr)
-            failed.append({"url": url, "error": str(e)})
-            continue
+    # Track cumulative counts across all snapshots for the final summary.
+    all_succeeded: list = []
+    all_failed: list = []
+    all_skipped: list = []
 
-        repo_url = info["repo_url"] if info["repo_url"] else url
-        org = info["org"]
-        repo_name = extract_qualified_repo_name(repo_url)
+    # Normalise: single-window mode is modelled as one synthetic snapshot with
+    # no label so outputs land in the flat ``output_dir/repo_name/`` layout.
+    if snapshots:
+        iterations: list[tuple[str, str, Optional[str]]] = [
+            (s, e, lbl) for s, e, lbl in snapshots
+        ]
+    else:
+        iterations = [(start_date, end_date, None)]
 
-        progress = f"[{idx}/{total_repos}]"
+    for snap_idx, (snap_start, snap_end, snap_label) in enumerate(iterations, 1):
+        if snap_label is not None:
+            marker_path = output_dir / f".done_{snap_label}"
+            if marker_path.exists():
+                print(f"[snap {snap_idx}/{len(iterations)}] {snap_label}: "
+                      f"[skip] marker present")
+                continue
+            # Reset any existing clones to origin tip so find_commit_at_date
+            # sees full history for the new window. No-op on first snapshot
+            # when the clone dir doesn't yet exist.
+            _reset_clones_to_origin(clone_base_dir)
+            print("")
+            print("=" * 60)
+            print(f"[snap {snap_idx}/{len(iterations)}] window [{snap_start}, {snap_end}) "
+                  f"→ {snap_label}")
+            print("=" * 60)
 
-        # Detect branch for single repos
-        if info["mode"] == "single-repo":
-            branch = detect_default_branch(repo_url, args.token)
-            if not branch:
-                # Try common default branch names via ls-remote
-                for candidate in ("main", "master"):
-                    try:
-                        result = subprocess.run(
-                            ["git", "ls-remote", "--heads", repo_url, candidate],
-                            capture_output=True, text=True, timeout=30,
-                        )
-                        if result.returncode == 0 and candidate in result.stdout:
-                            branch = candidate
-                            break
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                        continue
-                else:
-                    branch = "main"
-        else:
-            branch = "main"
-
-        # Skip if already complete
-        if check_output_complete(output_dir, repo_name):
-            print(f"{progress} [skip] {repo_name}: output already complete")
-            skipped.append(repo_name)
-            continue
-
-        per_repo_overrides = dict(
-            repo_url=repo_url,
-            branch=branch,
-            repo_name=repo_name,
+        succeeded, failed, skipped = _process_repos_for_snapshot(
+            repo_entries,
+            token=args.token,
+            model=model,
+            yaml_cfg=yaml_cfg,
             clone_base_dir=clone_base_dir,
             artifacts_dir=artifacts_dir,
             output_dir=output_dir,
             author_strategy=author_strategy,
-            author_salt=str(uuid.uuid4()),
             author_secret=author_secret,
-            author_org=org,
+            permanent_failures=permanent_failures,
+            start_date=snap_start,
+            end_date=snap_end,
+            snapshot_label=snap_label,
+            delete_clone=args.delete_clone,
+            parallel_repos=args.parallel_repos,
         )
-        if end_date is not None:
-            per_repo_overrides["end_date"] = end_date
+        all_succeeded.extend(succeeded)
+        all_failed.extend(failed)
+        all_skipped.extend(skipped)
 
-        config = config_to_pipeline_config(yaml_cfg, **per_repo_overrides)
+        # Touch the .done marker only after the snapshot's entire repo loop
+        # finishes. A crash mid-loop leaves no marker → snapshot re-runs on
+        # next invocation; repos already written under the snapshot subdir
+        # are skipped by check_output_complete().
+        if snap_label is not None:
+            marker_path.touch()
+            print(f"[snap {snap_idx}/{len(iterations)}] {snap_label}: done — "
+                  f"{len(succeeded)} ok, {len(failed)} fail, {len(skipped)} skip")
 
-        print(f"\n{progress} [start] {repo_name}")
-        print(f"         url:    {repo_url}")
-        print(f"         branch: {branch}")
-        repo_start = time.time()
-        try:
-            result = run_pipeline(config, token=args.token, model=model)
-            elapsed = time.time() - repo_start
-            print(f"{progress} [done]  {repo_name} in {elapsed:.1f}s "
-                  f"-- {result.n_with_embedding} embeddings, "
-                  f"{result.n_without_embedding} skipped")
-            succeeded.append(repo_name)
-        except Exception as e:
-            elapsed = time.time() - repo_start
-            print(f"{progress} [FAIL]  {repo_name} after {elapsed:.1f}s: {e}", file=sys.stderr)
-            failed.append({"url": repo_url, "error": str(e)})
+    succeeded = all_succeeded
+    failed = all_failed
+    skipped = all_skipped
 
     # Cleanup
     del model
@@ -253,6 +659,25 @@ def main():
                         help="Personal Access Token (optional; without it only public repos are accessible)")
     parser.add_argument("--config", default=None,
                         help="Path to config.yaml (default: <project_root>/config.yaml)")
+    parser.add_argument("--delete-clone", action="store_true",
+                        help="Delete each repo's clone directory after processing "
+                             "(reduces disk usage for large sweeps at the cost of "
+                             "re-cloning on subsequent runs)")
+    parser.add_argument("--snapshots-file", default=None,
+                        help="Path to a TSV file with one snapshot per line in the "
+                             "form 'start_date<TAB>end_date[<TAB>label]'. When set, "
+                             "the embedding model is loaded once and the repo loop "
+                             "runs per snapshot, writing outputs under "
+                             "<output>/<repo>/<label>/ and a <output>/.done_<label> "
+                             "marker after each snapshot completes. Only used with "
+                             "--repos-file.")
+    parser.add_argument("--parallel-repos", type=int, default=1,
+                        help="Number of repos to process concurrently within a "
+                             "single snapshot. Default 1 (serial, matches legacy "
+                             "behaviour). Recommended 4-6 on a 12-core machine; "
+                             "git I/O and embedding both release the GIL so "
+                             "threads parallelise effectively. Only used with "
+                             "--repos-file.")
     args = parser.parse_args()
 
     if args.repos_file:
@@ -411,6 +836,12 @@ def main():
             elapsed = time.time() - repo_start
             print(f"{progress} [FAIL]  {repo_name} after {elapsed:.1f}s: {e}", file=sys.stderr)
             failed.append({"url": repo_url, "error": str(e)})
+
+        # Optional per-repo clone cleanup to cap disk usage during large sweeps.
+        if args.delete_clone:
+            clone_dir = clone_base_dir / repo_name
+            if clone_dir.exists():
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     # 4. Cleanup
     del model

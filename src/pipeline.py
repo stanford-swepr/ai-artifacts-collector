@@ -86,6 +86,12 @@ class PipelineConfig:
     author_hash_length: int = 12        # used by anonymize
     author_prefix: str = "user-"        # used by anonymize
 
+    # When set, per-repo outputs are written under
+    # ``output_dir/repo_name/snapshot_label/`` and repo skip-checks look there.
+    # When ``None``, outputs land directly in ``output_dir/repo_name/`` (the
+    # pre-snapshot flat layout).
+    snapshot_label: Optional[str] = None
+
 
 @dataclass
 class PipelineResult:
@@ -460,7 +466,10 @@ def export_results(
     bundle_artifacts_config(config.artifacts_dir, config.output_dir)
     write_manifest(config.output_dir, config)
 
-    output_dir = config.output_dir / config.repo_name
+    # When a snapshot_label is set, outputs land under the snapshot subdir so
+    # multiple snapshot runs for the same repo don't overwrite each other.
+    repo_root = config.output_dir / config.repo_name
+    output_dir = repo_root / config.snapshot_label if config.snapshot_label else repo_root
     output_dir.mkdir(parents=True, exist_ok=True)
     repo_name = config.repo_name
     exported: Dict[str, Path] = {}
@@ -576,13 +585,22 @@ def write_manifest(output_dir: Path, config: PipelineConfig) -> Path:
     return manifest_path
 
 
-def check_output_complete(output_dir: Path, repo_name: str) -> bool:
+def check_output_complete(
+    output_dir: Path,
+    repo_name: str,
+    snapshot_label: Optional[str] = None,
+) -> bool:
     """Check whether pipeline output already exists for *repo_name*.
 
-    Returns ``True`` when the output directory contains the expected 4 CSVs
+    When *snapshot_label* is provided, checks ``output_dir/repo_name/<label>/``;
+    otherwise checks the flat ``output_dir/repo_name/``.
+
+    Returns ``True`` when the target directory contains the expected 4 CSVs
     and 1 PKL file.
     """
     repo_output = output_dir / repo_name
+    if snapshot_label is not None:
+        repo_output = repo_output / snapshot_label
     if not repo_output.exists():
         return False
     csv_count = len(list(repo_output.glob("*.csv")))
