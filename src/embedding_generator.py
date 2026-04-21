@@ -14,10 +14,20 @@ from typing import List, Dict, Any, Optional
 import gc
 import os
 import tempfile
+import threading
 import warnings
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+
+# Serialises model.encode() calls so multiple repo-processing threads sharing
+# a single SentenceTransformer instance don't race on the MPS/CUDA device.
+# The device already serialises GPU kernels internally; this lock keeps the
+# Python-side state (tokenizer, framework internals) consistent when encode()
+# is invoked concurrently. Single-threaded callers pay a negligible
+# acquire/release cost.
+_ENCODE_LOCK = threading.Lock()
+
 
 # Default embedding model
 DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
@@ -289,9 +299,10 @@ def _batch_encode(
             if sorted_labels:
                 pbar.set_postfix_str(sorted_labels[pos], refresh=False)
 
-            embs = model.encode(
-                chunk_texts, batch_size=safe_bs, show_progress_bar=False
-            )
+            with _ENCODE_LOCK:
+                embs = model.encode(
+                    chunk_texts, batch_size=safe_bs, show_progress_bar=False
+                )
             if embs.ndim == 1:
                 embs = embs.reshape(1, -1)
 
@@ -369,12 +380,14 @@ def _embed_long_text(
     chunks = _chunk_text(prefixed_text, model.tokenizer, max_tokens, chunk_overlap)
 
     if len(chunks) == 1:
-        return np.array(model.encode(chunks[0]))
+        with _ENCODE_LOCK:
+            return np.array(model.encode(chunks[0]))
 
     # Encode each chunk and mean-pool
     chunk_embeddings = []
     for chunk in chunks:
-        emb = model.encode(chunk)
+        with _ENCODE_LOCK:
+            emb = model.encode(chunk)
         chunk_embeddings.append(np.array(emb))
 
     return np.mean(chunk_embeddings, axis=0)

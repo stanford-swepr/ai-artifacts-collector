@@ -56,6 +56,12 @@ if [[ "${DELETE_CLONE:-0}" == "1" ]]; then
   DELETE_CLONE_ARG=( --delete-clone )
 fi
 
+# PARALLEL_REPOS=N runs N repos concurrently inside a snapshot. Default 1
+# (serial). Recommended 4-6 on a 12-core machine; git I/O and embedding both
+# release the GIL, so threads give real parallelism. Higher values risk
+# saturating your network or git-provider rate limits.
+PARALLEL_REPOS="${PARALLEL_REPOS:-1}"
+
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
 if [[ ! -f "${REPOS_FILE}" ]]; then
@@ -138,6 +144,7 @@ python "${SCRIPT_DIR}/scripts/artifacts_collection.py" \
     --repos-file "${REPOS_FILE}" \
     --config "${CONFIG_SNAP}" \
     --snapshots-file "${SNAPS_TSV}" \
+    --parallel-repos "${PARALLEL_REPOS}" \
     ${TOKEN_ARG[@]+"${TOKEN_ARG[@]}"} \
     ${DELETE_CLONE_ARG[@]+"${DELETE_CLONE_ARG[@]}"} \
     2>&1 | tee "${LOG_DIR}/collect_$(date '+%Y%m%d_%H%M%S').log"
