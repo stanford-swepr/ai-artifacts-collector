@@ -24,6 +24,7 @@ Usage (repos file — one URL per line, model loaded once):
 import argparse
 import gc
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -50,6 +51,80 @@ from src.pipeline import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Permanent-failure cache
+# ---------------------------------------------------------------------------
+# Stored at <output_dir>/.permanent_failures.json as {"<url>": "<reason>"}.
+# Populated when a repo fails for a reason that cannot change between
+# snapshots (not-found / auth / permission). Subsequent snapshots read this
+# file and skip cached URLs without touching the network.
+#
+# Transient failures (timeouts, 5xx, network errors) are NOT cached so they
+# can retry in the next snapshot.
+# Per-date failures ("No commits found before <date>") are also NOT cached:
+# a later snapshot's cutoff may include the repo's first commit.
+
+PERMANENT_FAILURE_PATTERNS = (
+    "repository not found",
+    "does not exist",
+    "authentication failed",
+    "permission denied",
+    "access denied",
+    "unknown git provider",
+)
+TRANSIENT_FAILURE_MARKERS = (
+    "timed out",
+    "timeout",
+    "no commits found",
+    "500",
+    "502",
+    "503",
+    "504",
+    "connection refused",
+    "connection reset",
+    "could not resolve host",
+    "temporary failure",
+    "network is unreachable",
+)
+
+
+def _classify_failure(error_msg: str) -> str:
+    """Return 'permanent' if the error can never succeed, 'transient' otherwise."""
+    lower = error_msg.lower()
+    for marker in TRANSIENT_FAILURE_MARKERS:
+        if marker in lower:
+            return "transient"
+    for marker in PERMANENT_FAILURE_PATTERNS:
+        if marker in lower:
+            return "permanent"
+    return "transient"  # fail-safe: retry unknown errors
+
+
+def _load_permanent_failures(output_dir: Path) -> dict[str, str]:
+    cache_path = output_dir / ".permanent_failures.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        import json
+        return json.loads(cache_path.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def _persist_permanent_failure(output_dir: Path, url: str, reason: str) -> None:
+    cache_path = output_dir / ".permanent_failures.json"
+    import json
+    data = _load_permanent_failures(output_dir)
+    if url in data:
+        return
+    data[url] = reason
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass  # best effort
+
+
 def run_from_file(args):
     """Process repos listed in a text file (one URL per line).
 
@@ -60,12 +135,24 @@ def run_from_file(args):
         print(f"Error: repos file not found: {repos_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Read and filter repo URLs
+    # Read and filter repo entries. Each non-comment line is either:
+    #   "<url>"               — branch will be auto-detected
+    #   "<url>\t<branch>"     — preset branch skips detect_default_branch / ls-remote
     lines = repos_path.read_text().splitlines()
-    repo_urls = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-    if not repo_urls:
+    repo_entries: list[tuple[str, str | None]] = []
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "\t" in s:
+            url, branch = s.split("\t", 1)
+            repo_entries.append((url.strip(), branch.strip() or None))
+        else:
+            repo_entries.append((s, None))
+    if not repo_entries:
         print("Error: no repository URLs found in file", file=sys.stderr)
         sys.exit(1)
+    repo_urls = [u for u, _ in repo_entries]  # kept for logging / len()
 
     # -- Load YAML config --
     config_path = Path(args.config) if args.config else project_root / "config.yaml"
@@ -136,18 +223,35 @@ def run_from_file(args):
     bundle_artifacts_config(artifacts_dir, output_dir)
     write_manifest(output_dir, dummy_config)
 
+    # Load the per-connection permanent-failure cache so we can skip repos
+    # that previously failed with a non-retryable error.
+    permanent_failures = _load_permanent_failures(output_dir)
+    if permanent_failures:
+        print(f"  [cache] {len(permanent_failures)} repos marked as permanent failures — will skip")
+
     # Process repos
     succeeded = []
     failed = []
     skipped = []
 
-    for idx, url in enumerate(repo_urls, 1):
+    for idx, (url, preset_branch) in enumerate(repo_entries, 1):
+        # Short-circuit: if a previous snapshot flagged this URL as a permanent
+        # failure (404 / auth / not-found), skip it here without touching git.
+        if url in permanent_failures:
+            reason = permanent_failures[url]
+            print(f"[{idx}/{total_repos}] [skip-cached] {url}: {reason}")
+            skipped.append(url)
+            continue
+
         # Parse each URL to extract org info
         try:
             info = parse_target(url)
         except ValueError as e:
             print(f"[{idx}/{total_repos}] [FAIL] {url}: {e}", file=sys.stderr)
             failed.append({"url": url, "error": str(e)})
+            if _classify_failure(str(e)) == "permanent":
+                _persist_permanent_failure(output_dir, url, str(e))
+                permanent_failures[url] = str(e)
             continue
 
         repo_url = info["repo_url"] if info["repo_url"] else url
@@ -156,8 +260,11 @@ def run_from_file(args):
 
         progress = f"[{idx}/{total_repos}]"
 
-        # Detect branch for single repos
-        if info["mode"] == "single-repo":
+        # Branch resolution: trust the preset from the repos file when provided
+        # (DB-sourced); otherwise auto-detect.
+        if preset_branch:
+            branch = preset_branch
+        elif info["mode"] == "single-repo":
             branch = detect_default_branch(repo_url, args.token)
             if not branch:
                 # Try common default branch names via ls-remote
@@ -215,6 +322,15 @@ def run_from_file(args):
             elapsed = time.time() - repo_start
             print(f"{progress} [FAIL]  {repo_name} after {elapsed:.1f}s: {e}", file=sys.stderr)
             failed.append({"url": repo_url, "error": str(e)})
+            if _classify_failure(str(e)) == "permanent":
+                _persist_permanent_failure(output_dir, url, str(e))
+                permanent_failures[url] = str(e)
+
+        # Optional per-repo clone cleanup to cap disk usage during large sweeps.
+        if args.delete_clone:
+            clone_dir = clone_base_dir / repo_name
+            if clone_dir.exists():
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     # Cleanup
     del model
@@ -253,6 +369,10 @@ def main():
                         help="Personal Access Token (optional; without it only public repos are accessible)")
     parser.add_argument("--config", default=None,
                         help="Path to config.yaml (default: <project_root>/config.yaml)")
+    parser.add_argument("--delete-clone", action="store_true",
+                        help="Delete each repo's clone directory after processing "
+                             "(reduces disk usage for large sweeps at the cost of "
+                             "re-cloning on subsequent runs)")
     args = parser.parse_args()
 
     if args.repos_file:
@@ -411,6 +531,12 @@ def main():
             elapsed = time.time() - repo_start
             print(f"{progress} [FAIL]  {repo_name} after {elapsed:.1f}s: {e}", file=sys.stderr)
             failed.append({"url": repo_url, "error": str(e)})
+
+        # Optional per-repo clone cleanup to cap disk usage during large sweeps.
+        if args.delete_clone:
+            clone_dir = clone_base_dir / repo_name
+            if clone_dir.exists():
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     # 4. Cleanup
     del model

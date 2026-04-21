@@ -34,13 +34,25 @@ fi
 
 REPOS_FILE="${REPOS_FILE:-${SCRIPT_DIR}/repos_msrc.txt}"
 CONFIG_BASE="${CONFIG_BASE:-${SCRIPT_DIR}/config.yaml}"
-CONFIG_SNAP="${SCRIPT_DIR}/.config_monthly_snap.yaml"
-OUTPUT_DIR="${SCRIPT_DIR}/output/msrc"
-CLONE_DIR="${SCRIPT_DIR}/../analyzed_repos/msrc"
+# OUT_PATH_SLUG controls the subdirectory under output/ and ../analyzed_repos/.
+# Default "msrc" preserves the original behaviour; per-connection runs can set
+# e.g. OUT_PATH_SLUG=magic-caterpillar to keep outputs and clones segregated.
+OUT_PATH_SLUG="${OUT_PATH_SLUG:-msrc}"
+# Per-slug temp config so concurrent sweeps (e.g. partitioned by org range)
+# don't overwrite each other's snapshot window between phases.
+CONFIG_SNAP="${SCRIPT_DIR}/.config_monthly_snap.${OUT_PATH_SLUG}.yaml"
+OUTPUT_DIR="${SCRIPT_DIR}/output/${OUT_PATH_SLUG}"
+CLONE_DIR="${SCRIPT_DIR}/../analyzed_repos/${OUT_PATH_SLUG}"
 LOG_DIR="${OUTPUT_DIR}/logs"
 TOKEN_ARG=()
 if [[ -n "${TOKEN:-}" ]]; then
   TOKEN_ARG=( --token "${TOKEN}" )
+fi
+# DELETE_CLONE=1 tells the pipeline to rm each repo's clone dir after
+# processing it, capping disk usage during large per-connection sweeps.
+DELETE_CLONE_ARG=()
+if [[ "${DELETE_CLONE:-0}" == "1" ]]; then
+  DELETE_CLONE_ARG=( --delete-clone )
 fi
 
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
@@ -58,11 +70,14 @@ if (( $# > 0 )); then
   # Positional args override the default 23-date list (e.g. for test runs).
   SNAPSHOTS=( "$@" )
 else
+  # Snapshot windows are half-open [prev_month_first, snap). For the study
+  # range "Jan 2024 through Nov 2025" to cover commits IN both endpoint
+  # months, the list must include 2025-12-01 (which captures Nov 2025 commits).
   SNAPSHOTS=(
     "2024-01-01" "2024-02-01" "2024-03-01" "2024-04-01" "2024-05-01" "2024-06-01"
     "2024-07-01" "2024-08-01" "2024-09-01" "2024-10-01" "2024-11-01" "2024-12-01"
     "2025-01-01" "2025-02-01" "2025-03-01" "2025-04-01" "2025-05-01" "2025-06-01"
-    "2025-07-01" "2025-08-01" "2025-09-01" "2025-10-01" "2025-11-01"
+    "2025-07-01" "2025-08-01" "2025-09-01" "2025-10-01" "2025-11-01" "2025-12-01"
   )
 fi
 
@@ -79,12 +94,12 @@ PY
 
 # Generate .config_monthly_snap.yaml by cloning the base config and overriding:
 #   temporal.start_date, temporal.end_date
-#   paths.output_dir   = "output/msrc"        (replaces any {organisation})
-#   paths.clone_dir    = "../analyzed_repos/msrc"
+#   paths.output_dir   = "output/<OUT_PATH_SLUG>"        (replaces any {organisation})
+#   paths.clone_dir    = "../analyzed_repos/<OUT_PATH_SLUG>"
 write_snapshot_config() {
   # $1 = prev_month_first (ISO date), $2 = snapshot_date (ISO date)
   CONFIG_BASE="${CONFIG_BASE}" START_DATE="$1" END_DATE="$2" \
-  OUT_PATH="output/msrc" CLONE_PATH="../analyzed_repos/msrc" \
+  OUT_PATH="output/${OUT_PATH_SLUG}" CLONE_PATH="../analyzed_repos/${OUT_PATH_SLUG}" \
   python3 - <<'PY' > "${CONFIG_SNAP}"
 import os, sys, yaml
 with open(os.environ["CONFIG_BASE"]) as f:
@@ -146,6 +161,7 @@ for SNAP in "${SNAPSHOTS[@]}"; do
       --repos-file "${REPOS_FILE}" \
       --config "${CONFIG_SNAP}" \
       ${TOKEN_ARG[@]+"${TOKEN_ARG[@]}"} \
+      ${DELETE_CLONE_ARG[@]+"${DELETE_CLONE_ARG[@]}"} \
       2>&1 | tee "${LOG_DIR}/collect_${SNAP}.log"
 
   # Move each repo's freshly-written flat-level outputs into the snapshot subdir.
