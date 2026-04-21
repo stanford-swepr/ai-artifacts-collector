@@ -126,9 +126,11 @@ with open(out_path, "w") as f:
     f.write("\n".join(rows) + "\n")
 PY
 
+# Bash 3.2 (macOS default) can't do "${array[-1]}", so compute the last index.
+LAST_IDX=$(( ${#SNAPSHOTS[@]} - 1 ))
 echo "================================================================"
 echo " Monthly snapshot run (slug=${OUT_PATH_SLUG})"
-echo "   snapshots:   ${#SNAPSHOTS[@]}  (${SNAPSHOTS[0]} … ${SNAPSHOTS[-1]})"
+echo "   snapshots:   ${#SNAPSHOTS[@]}  (${SNAPSHOTS[0]} … ${SNAPSHOTS[${LAST_IDX}]})"
 echo "   repos-file:  ${REPOS_FILE}"
 echo "   output_dir:  ${OUTPUT_DIR}"
 echo "   clone_dir:   ${CLONE_DIR}"
