@@ -69,6 +69,7 @@ prod_orgs_to_process.numbers
 # Runtime-generated snapshot configs (written by collect_monthly.sh per slug,
 # removed on clean exit; leftovers after a crash are safe to delete).
 .config_monthly_snap*.yaml
+.snapshots.*.tsv
 
 # OS
 .DS_Store
